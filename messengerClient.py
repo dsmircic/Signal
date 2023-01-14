@@ -10,11 +10,12 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
 
-from base64 import b64encode
 
 from Crypto import Crypto
+from State import State
 
 parameters = dh.generate_parameters(generator=2, key_size=512)
+
 
 class MessengerClient:
     """ Messenger client klasa
@@ -35,15 +36,8 @@ class MessengerClient:
         self.ca_public_key = ca_public_key
         # Aktivne konekcije s drugim klijentima
         self.conns = {}
-        # Inicijalni Diffie-Hellman par ključeva iz metode `generate_certificate`
-        self.current_key_pair = tuple()
+        self.last_message = dict()
 
-        self.ck_send_user = dict()
-        self.ck_rec_user = dict()
-        self.root_chain = dict()
-
-        self.private_key = parameters.generate_private_key()
-        self.public_key = self.private_key.public_key()
 
     def generate_certificate(self):
         """ Generira par Diffie-Hellman ključeva i vraća certifikacijski objekt
@@ -60,14 +54,11 @@ class MessengerClient:
         """
 
         # Generate Diffie-Hellman key pair
-        self.current_key_pair = parameters.generate_private_key()
-
-        # Serialize public key
-
+        self.initial_key_pair = parameters.generate_private_key()
 
         # Return certificate
         data = {'name': self.username,
-                'public_key': self.get_bytes_from_key(self.current_key_pair.public_key())
+                'public_key': self.get_bytes_from_key(self.initial_key_pair.public_key())
                 }
         return data
 
@@ -90,8 +81,7 @@ class MessengerClient:
         public_key = serialization.load_pem_public_key(
             cert['public_key'],
             backend=default_backend()
-        )   
-
+        )
 
         # Verify the signature using the CA's public key
         try:
@@ -106,10 +96,8 @@ class MessengerClient:
             return False
 
         # Signature is valid, store the client's name and public key
-        self.conns[cert['name']] = public_key
-
-        # exchange keys
-        self.root_chain[cert['name']] = self.current_key_pair.exchange(public_key)
+        self.conns[cert['name']] = State(
+            self.initial_key_pair, public_key, None, None)
         return True
 
     def get_bytes_from_key(self, key):
@@ -140,32 +128,36 @@ class MessengerClient:
         Metoda treba vratiti kriptiranu poruku zajedno sa zaglavljem.
 
         """
-        if self.ck_send_user.get(username) is None:
-            self.ck_send_user[username] = self.root_chain[username]
-        
-        root_key = self.ck_send_user[username]
-        new_rk, mk = Crypto.KDF(rootKey=root_key)
+        if self.conns[username].reset:
 
-        self.root_chain[username] = new_rk
+            dh_private_key = parameters.generate_private_key()
 
-        # encrypt message
-        ciphertext, iv = Crypto.encrypt(mk, message)
+            peer_public_key = self.conns[username].peer_public_key
+            shared_key = dh_private_key.exchange(peer_public_key)
 
-        # create header
+            new_rk, mk = Crypto.KDF(rootKey=shared_key)
+            self.conns[username] = State(
+                dh_private_key, peer_public_key, new_rk, mk)
+
+        new_rk, mk = Crypto.KDF(rootKey=self.conns[username].root_key)
+        self.conns[username].root_key = new_rk
+        self.conns[username].sending_key = mk
+
+        ciphertext, iv = Crypto.encrypt(
+            self.conns[username].sending_key, message)
+        public_key_serialized = self.get_bytes_from_key(
+            self.conns[username].key_pair.public_key())
+
         header = {
-            'iv' : iv,
-            'public_key' : self.get_bytes_from_key(self.current_key_pair.public_key())
+            'iv': iv,
+            'public_key': public_key_serialized
         }
 
-        # create message
         data = {
-            'header' : header,
-            'ciphertext' : ciphertext,
-            'sender' : self.username
+            'ciphertext': ciphertext,
+            'iv': iv,
+            'header': header
         }
-
-        # update sending chain
-        self.ck_send_user[username] = new_rk
 
         return data
 
@@ -192,32 +184,86 @@ class MessengerClient:
         Metoda treba vratiti dekriptiranu poruku.
 
         """
-        header = message['header']
-        iv = header['iv']
-        ciphertext = message['ciphertext']
 
-        peer_public_key = serialization.load_pem_public_key(header['public_key'], backend=default_backend())
+        if self.last_message.get(username) is None:
+            self.last_message[username] = message['ciphertext']
+        else:
+            if self.last_message[username] == message['ciphertext']:
+                raise Exception("Replay attack detected!")
+            else:
+                self.last_message[username] = message['ciphertext']
 
-        if self.ck_rec_user.get(username) is None:
-            self.ck_rec_user[username] = self.root_chain[username]
+        old_peer_public_key = self.get_bytes_from_key(
+            self.conns[username].peer_public_key)
+        new_peer_public_key = message['header']['public_key']
 
-        root_key = self.ck_rec_user[username]
-        new_rk, mk = Crypto.KDF(rootKey=root_key)
+        if new_peer_public_key != old_peer_public_key:
 
-        self.root_chain[username] = new_rk
+            dh_private_key = self.conns[username].key_pair
+            peer_public_key = serialization.load_pem_public_key(
+                new_peer_public_key)
 
-        # decrypt message
-        plaintext = Crypto.decrypt(messageKey=mk, ciphertext=ciphertext, iv=iv)
+            shared_key = dh_private_key.exchange(peer_public_key)
 
-        if peer_public_key != self.conns[username]:
-            self.current_key_pair = parameters.generate_private_key()
+            root_key, mk = Crypto.KDF(rootKey=shared_key)
+            self.conns[username] = State(
+                dh_private_key, peer_public_key, root_key, mk)
+        else:
+            self.conns[username].reset = False
 
-        # update receiving chain
-        self.ck_rec_user[username] = new_rk
-        return plaintext
+        self.conns[username].reset = True
+        _, mk = Crypto.KDF(rootKey=self.conns[username].root_key)
+
+        return Crypto.decrypt(mk, message['ciphertext'], message['iv'])
+
+# def generate_p384_key_pair():
+#     secret_key = ec.generate_private_key(ec.SECP384R1())
+#     public_key = secret_key.public_key()
+#     return (secret_key, public_key)
+
+# def sign_with_ecdsa(secret_key, data):
+#     signature = secret_key.sign(data, ec.ECDSA(hashes.SHA256()))
+#     return signature
 
 
 def main():
+    # ca_sk, ca_pk = generate_p384_key_pair()
+
+    # alice = MessengerClient('Alice', ca_pk)
+    # bob = MessengerClient('Bob', ca_pk)
+
+    # alice_cert = alice.generate_certificate()
+    # bob_cert = bob.generate_certificate()
+
+    # alice_cert_sign = sign_with_ecdsa(ca_sk, pickle.dumps(alice_cert))
+    # bob_cert_sign = sign_with_ecdsa(ca_sk, pickle.dumps(bob_cert))
+
+    # alice.receive_certificate(bob_cert, bob_cert_sign)
+    # bob.receive_certificate(alice_cert, alice_cert_sign)
+
+    # plaintext = 'Hi Bob!'
+    # message = alice.send_message('Bob', plaintext)
+
+    # result = bob.receive_message('Alice', message)
+    # print(plaintext, result)
+
+    # plaintext = 'Hey Alice!'
+    # message = bob.send_message('Alice', plaintext)
+
+    # result = alice.receive_message('Bob', message)
+    # print(plaintext, result)
+
+    # plaintext = 'Are you studying for the exam tomorrow?'
+    # message = bob.send_message('Alice', plaintext)
+
+    # result = alice.receive_message('Bob', message)
+    # print(plaintext, result)
+
+    # plaintext = 'Yes. How about you?'
+    # message = alice.send_message('Bob', plaintext)
+
+    # result = bob.receive_message('Alice', message)
+    # print(plaintext, result)
     pass
 
 

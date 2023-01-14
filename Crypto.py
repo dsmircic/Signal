@@ -47,7 +47,7 @@ class Crypto:
         )
         ciphertext = cipher.encrypt(bytes(plaintext, 'utf-8'))
 
-        return b64encode(ciphertext).decode(), b64encode(iv).decode()
+        return ciphertext, iv
 
     @staticmethod
     def decrypt(messageKey, ciphertext, iv: bytes):
@@ -57,7 +57,7 @@ class Crypto:
             mode=AES.MODE_GCM
         )
 
-        return cipher.decrypt(ciphertext)
+        return cipher.decrypt(ciphertext).decode('utf-8')
 
     @staticmethod
     def ratchetEncrypt(plaintext, chainKey):

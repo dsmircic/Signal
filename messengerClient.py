@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+# #!/usr/bin/env python3
 
 import pickle
 import os
@@ -6,16 +6,15 @@ import os
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import dh
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
 
-from base64 import b64decode, b64encode
+from base64 import b64encode
 
 from Crypto import Crypto
 
+parameters = dh.generate_parameters(generator=2, key_size=512)
 
 class MessengerClient:
     """ Messenger client klasa
@@ -24,29 +23,27 @@ class MessengerClient:
         prikladnim.
     """
 
-    def __init__(self, username, ca_pub_key):
+    def __init__(self, username, ca_public_key):
         """ Inicijalizacija klijenta
 
         Argumenti:
         username (str) -- ime klijenta
-        ca_pub_key     -- javni ključ od CA (certificate authority)
+        ca_public_key     -- javni ključ od CA (certificate authority)
 
         """
         self.username = username
-        self.ca_pub_key = ca_pub_key
+        self.ca_public_key = ca_public_key
         # Aktivne konekcije s drugim klijentima
         self.conns = {}
         # Inicijalni Diffie-Hellman par ključeva iz metode `generate_certificate`
-        self.dh_key_pair = dict()
-        self.key_chain_init()
+        self.current_key_pair = tuple()
 
-    def key_chain_init(self):
         self.ck_send_user = dict()
         self.ck_rec_user = dict()
+        self.root_chain = dict()
 
-    def add_connection(self, username, ck_send, ck_rec):
-        self.ck_send_user[username] = ck_send
-        self.ck_rec_user[username] = ck_rec
+        self.private_key = parameters.generate_private_key()
+        self.public_key = self.private_key.public_key()
 
     def generate_certificate(self):
         """ Generira par Diffie-Hellman ključeva i vraća certifikacijski objekt
@@ -63,19 +60,14 @@ class MessengerClient:
         """
 
         # Generate Diffie-Hellman key pair
-        key_pair = dh.generate_parameters(
-            generator=2, key_size=2048, backend=default_backend()).generate_private_key()
-        # Serialize public key
-        public_key = key_pair.public_key().public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
+        self.current_key_pair = parameters.generate_private_key()
 
-        self.dh_key_pair[self.username] = public_key
+        # Serialize public key
+
 
         # Return certificate
         data = {'name': self.username,
-                'public_key': public_key
+                'public_key': self.get_bytes_from_key(self.current_key_pair.public_key())
                 }
         return data
 
@@ -98,11 +90,12 @@ class MessengerClient:
         public_key = serialization.load_pem_public_key(
             cert['public_key'],
             backend=default_backend()
-        )
+        )   
+
 
         # Verify the signature using the CA's public key
         try:
-            self.ca_pub_key.verify(
+            self.ca_public_key.verify(
                 signature,
                 pickle.dumps(cert),
                 ec.ECDSA(hashes.SHA256())
@@ -114,9 +107,13 @@ class MessengerClient:
 
         # Signature is valid, store the client's name and public key
         self.conns[cert['name']] = public_key
-        print(self.conns)
+
+        # exchange keys
+        self.root_chain[cert['name']] = self.current_key_pair.exchange(public_key)
         return True
 
+    def get_bytes_from_key(self, key):
+        return key.public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
 
     def send_message(self, username, message):
         """ Slanje poruke klijentu
@@ -143,37 +140,35 @@ class MessengerClient:
         Metoda treba vratiti kriptiranu poruku zajedno sa zaglavljem.
 
         """
-        if username not in self.ck_send_user.keys():
-            self.ck_send_user[username] = self.conns[username]
+        if self.ck_send_user.get(username) is None:
+            self.ck_send_user[username] = self.root_chain[username]
+        
+        root_key = self.ck_send_user[username]
+        new_rk, mk = Crypto.KDF(rootKey=root_key)
 
-        ck_send = self.ck_send_user[username].public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
+        self.root_chain[username] = new_rk
 
-        new_ck, new_mk = Crypto.KDF(ck_send)
+        # encrypt message
+        ciphertext, iv = Crypto.encrypt(mk, message)
 
-        ciphertext, iv = Crypto.encrypt(
-            messageKey=new_mk, plaintext=message)
+        # create header
+        header = {
+            'iv' : iv,
+            'public_key' : self.get_bytes_from_key(self.current_key_pair.public_key())
+        }
 
-        self.ck_send_user[username] = new_ck
+        # create message
+        data = {
+            'header' : header,
+            'ciphertext' : ciphertext,
+            'sender' : self.username
+        }
 
-        header = dict()
-        header["public_key"] = ck_send
-        header["iv"] = iv
+        # update sending chain
+        self.ck_send_user[username] = new_rk
 
-        data = dict()
-        data["ciphertext"] = ciphertext
-        data["sender"] = self.username
+        return data
 
-        print(self.username + " ciphertext: " + ciphertext)
- 
-        return (header, data)
-
-    def check_user(self, username):
-        if username not in self.ck_rec_user.keys():
-            self.ck_rec_user[username] = self.conns[username]
-    
     def receive_message(self, username, message):
         """ Primanje poruke od korisnika
 
@@ -197,75 +192,32 @@ class MessengerClient:
         Metoda treba vratiti dekriptiranu poruku.
 
         """
+        header = message['header']
+        iv = header['iv']
+        ciphertext = message['ciphertext']
 
-        self.check_user(username)
+        peer_public_key = serialization.load_pem_public_key(header['public_key'], backend=default_backend())
 
-        data = message[1]
-        header = message[0]
+        if self.ck_rec_user.get(username) is None:
+            self.ck_rec_user[username] = self.root_chain[username]
 
-        pub_key = header["public_key"]
+        root_key = self.ck_rec_user[username]
+        new_rk, mk = Crypto.KDF(rootKey=root_key)
 
-        text = b64decode(data["ciphertext"])
-        iv = bytes(b64decode(header["iv"]))
+        self.root_chain[username] = new_rk
 
-        new_ck, new_mk = Crypto.KDF(pub_key)
-        plaintext = Crypto.decrypt(messageKey=new_mk, ciphertext=text, iv=iv)
+        # decrypt message
+        plaintext = Crypto.decrypt(messageKey=mk, ciphertext=ciphertext, iv=iv)
 
-        self.ck_rec_user[username] = new_ck
+        if peer_public_key != self.conns[username]:
+            self.current_key_pair = parameters.generate_private_key()
 
-        print(self.username + "plaintext: " + plaintext.decode())
-
-        return plaintext.decode()
-
-
-@staticmethod
-def ratchetEncrypt(plaintext, chainKey):
-    newChainKey, messageKey = Crypto.KDF(chainKey)
-    ciphertext, iv = Crypto.encrypt(
-        messageKey=messageKey, plaintext=plaintext)
-
-    return newChainKey, ciphertext, iv
-
-
-@staticmethod
-def ratchetDecrypt(ciphertext, chainKey, iv):
-    newChainKey, messageKey = Crypto.KDF(chainKey)
-
-    return newChainKey, Crypto.decrypt(messageKey=messageKey, ciphertext=ciphertext, iv=iv)
-
-
-def generate_p384_key_pair():
-    secret_key = ec.generate_private_key(ec.SECP384R1())
-    public_key = secret_key.public_key()
-    return (secret_key, public_key)
-
-
-def sign_with_ecdsa(secret_key, data):
-    signature = secret_key.sign(data, ec.ECDSA(hashes.SHA256()))
-    return signature
+        # update receiving chain
+        self.ck_rec_user[username] = new_rk
+        return plaintext
 
 
 def main():
-    ca_sk, ca_pk = generate_p384_key_pair()
-
-    alice = MessengerClient('Alice', ca_pk)
-    bob = MessengerClient('Bob', ca_pk)
-
-    alice_cert = alice.generate_certificate()
-    bob_cert = bob.generate_certificate()
-
-    alice_cert_sign = sign_with_ecdsa(ca_sk, pickle.dumps(alice_cert))
-    bob_cert_sign = sign_with_ecdsa(ca_sk, pickle.dumps(bob_cert))
-
-    alice.receive_certificate(bob_cert, bob_cert_sign)
-    bob.receive_certificate(alice_cert, alice_cert_sign)
-
-    plaintext = 'Hi Bob!'
-    message = alice.send_message('Bob', plaintext)
-
-    received_message = bob.receive_message('Alice', message=message)
-
-    input("Press enter to continue...")
     pass
 
 
